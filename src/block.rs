@@ -140,7 +140,9 @@ impl BlockAllocator {
         let next = header.read_volatile().next(header as u64);
         if next as u64 != self.bottom {
             let mut value = next.read_volatile();
-            total_size += value.size() + HEADER_SIZE;
+            if !next.read_volatile().allocated() {
+                total_size += value.size() + HEADER_SIZE;
+            }
             value.set(BlockHeader::PREVIOUS_BLOCK_ALLOCATED, false);
             next.write_volatile(value);
         }
@@ -502,6 +504,42 @@ mod tests {
         for ptr in ptrs {
             unsafe { assert!(heap.dealloc_immediate_coalesce(ptr).is_ok()) };
         }
+        // try to allocate the entire heap, should work since there should be no fragmentation
+        let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        assert_eq!(
+            res.unwrap() as u64,
+            heap.bottom + size_of::<BlockHeader>() as u64
+        );
+    }
+
+    /// Test that if we allocate every spot then deallocate them all backwards we have no fragmentation
+    #[test]
+    fn coalescing_both() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
+
+        // allocate 3
+        let one = unsafe { heap.allocate_next_fit(layout.clone()) };
+        assert!(one.is_ok());
+
+        let two = unsafe { heap.allocate_next_fit(layout.clone()) };
+        assert!(two.is_ok());
+
+        let three = unsafe { heap.allocate_next_fit(layout.clone()) };
+        assert!(three.is_ok());
+
+        dbg!(heap);
+        // dealloc 1st and 3rd
+        unsafe { assert!(heap.dealloc_immediate_coalesce(one.unwrap()).is_ok()) };
+        unsafe { assert!(heap.dealloc_immediate_coalesce(three.unwrap()).is_ok()) };
+
+        dbg!(heap);
+        // dealloc 2nd to force it to coalesce in both directions
+        unsafe { assert!(heap.dealloc_immediate_coalesce(two.unwrap()).is_ok()) };
+
         // try to allocate the entire heap, should work since there should be no fragmentation
         let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
         let res = unsafe { heap.allocate_next_fit(layout) };
