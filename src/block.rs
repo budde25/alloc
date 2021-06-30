@@ -99,7 +99,7 @@ impl BlockAllocator {
     }
 
     unsafe fn allocate_next_fit(&mut self, layout: Layout) -> Result<*mut u8, AllocateError> {
-        let size = round_to_eight(layout.size() as u64); // Must be a multiple of 8
+        let size = round_up_eight(layout.size() as u64); // Must be a multiple of 8
 
         self.next_free(size)?; // get us to a free block, that can fit our allocation
 
@@ -310,14 +310,13 @@ impl BlockHeader {
     }
 }
 
-/// panics if it would rounds above usize::max and round_to is 0
+/// panics if it would rounds above u64::max or round_to is 0
 fn round_to(value: u64, round_to: u64) -> u64 {
-    let round_down_to = round_to.checked_sub(1).unwrap();
-    value.checked_add(round_down_to).unwrap() & !(round_down_to)
+    value + (round_to - 1) & !(round_to - 1)
 }
 
 /// Convenience method that rounds up to the nearest multiple of 8
-fn round_to_eight(value: u64) -> u64 {
+fn round_up_eight(value: u64) -> u64 {
     round_to(value, 8)
 }
 
