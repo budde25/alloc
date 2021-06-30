@@ -1,6 +1,6 @@
 use alloc::alloc::GlobalAlloc;
 use bitflags::bitflags;
-use core::ptr::{self, read_volatile};
+use core::ptr;
 use core::{alloc::Layout, debug_assert, fmt};
 use spin::Mutex;
 
@@ -89,7 +89,7 @@ impl BlockAllocator {
     unsafe fn next_free(&mut self, size: u64) -> Result<(), AllocateError> {
         let start_ptr = self.current;
         let current = self.current.read_volatile();
-        while current.allocated() || current.size() < size + HEADER_SIZE {
+        while current.allocated() || current.size() < size {
             self.next();
             if self.current == start_ptr {
                 return Err(AllocateError::OutOfSpace);
@@ -107,17 +107,24 @@ impl BlockAllocator {
         // we found a spot
         self.current
             .write_volatile(BlockHeader::new(size, true, self.previous_allocated));
-        self.current = ((self.current as u64 + size) as *mut BlockHeader).add(1);
-        self.current.write_volatile(BlockHeader::new(
-            saved_size - (size + HEADER_SIZE),
-            false,
-            true,
-        ));
 
-        Ok((self.current as u64 - HEADER_SIZE) as *mut u8)
+        // ptr we are going to return
+        let data_start = self.current.add(1);
+
+        let next = ((self.current as u64 + size) as *mut BlockHeader).add(1);
+        if !next.read_volatile().end() {
+            next.write_volatile(BlockHeader::new(
+                saved_size - (size + HEADER_SIZE),
+                false,
+                true,
+            ));
+            self.current = next;
+        }
+
+        Ok((data_start) as *mut u8)
     }
 
-    unsafe fn dealloc_immediate_coalesce(&self, ptr: *mut u8) -> Result<(), AllocateError> {
+    unsafe fn dealloc_immediate_coalesce(&mut self, ptr: *mut u8) -> Result<(), AllocateError> {
         // Ensure the pointer is valid to avoid undefined behavior
         if ptr as u64 % 8 != 0 {
             return Err(AllocateError::InvalidPointer);
@@ -125,20 +132,36 @@ impl BlockAllocator {
 
         let mut header = (ptr as *mut BlockHeader).sub(1); // This ptr points to the start of the data, get us to the block header
 
-        let mut total_size = header.read_volatile().size() + HEADER_SIZE; // get the size of the new free area
+        let mut total_size = header.read_volatile().size(); // get the size of the new free area
 
         // immediate coalescing
-        while !header.read_volatile().previous_allocated() {
+        // front
+        // make sure next header doesn't say the previous is allocated
+        let next = header.read_volatile().next(header as u64);
+        if next as u64 != self.bottom {
+            let mut value = next.read_volatile();
+            total_size += value.size() + HEADER_SIZE;
+            value.set(BlockHeader::PREVIOUS_BLOCK_ALLOCATED, false);
+            next.write_volatile(value);
+        }
+
+        // back
+        if !header.read_volatile().previous_allocated() {
             let footer = header.sub(1);
-            let block_size = (*footer).size();
+            let block_size = footer.read_volatile().size();
 
             total_size += block_size + HEADER_SIZE;
             header = (header as u64 - (block_size + HEADER_SIZE)) as *mut BlockHeader;
         }
 
+        // update the header and footer
         header.write_volatile(BlockHeader::new(total_size, false, true));
-        let footer = (*header).footer(header as u64);
+        let footer = header.read_volatile().footer(header as u64);
         footer.write_volatile(BlockHeader::new(total_size, false, false));
+
+        // make sure that we don't save an invalid spot thanks to the coalescing
+        self.current = header;
+
         Ok(())
     }
 }
@@ -262,8 +285,8 @@ impl BlockHeader {
     }
 
     pub fn footer(&self, current_position: u64) -> *mut Self {
-        debug_assert!(self.previous_allocated());
-        (current_position - self.size()) as *mut BlockHeader
+        // debug_assert!(self.previous_allocated());
+        (current_position + self.size()) as *mut BlockHeader
     }
 
     /// Returns the size of the allocated data (without taking into account the header), will always be a multiple of 8
@@ -304,7 +327,9 @@ mod tests {
     use alloc::boxed::Box;
     use core::alloc::Layout;
     use core::mem::{align_of, size_of};
+    use std::{dbg, println};
     extern crate std;
+    use std::vec;
 
     /// Create a new heap, aka a box
     fn new_heap() -> BlockAllocator {
@@ -348,30 +373,6 @@ mod tests {
         );
     }
 
-    /// Test that we correctly deallocate one item
-    #[test]
-    fn dealloc_one() {
-        let mut heap = new_heap();
-        let layout = new_layout();
-        let res = unsafe { heap.allocate_next_fit(layout) };
-        assert!(res.is_ok());
-        let res = unsafe { heap.dealloc_immediate_coalesce(res.unwrap()) };
-        assert!(res.is_ok());
-    }
-
-    /// Test that deallocating a bad ptr throws an error
-    #[test]
-    fn dealloc_bad_ptr() {
-        let mut heap = new_heap();
-        let layout = new_layout();
-        let res = unsafe { heap.allocate_next_fit(layout) };
-        assert!(res.is_ok());
-        let res =
-            unsafe { heap.dealloc_immediate_coalesce(((res.unwrap() as u64) + 1) as *mut u8) };
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), AllocateError::InvalidPointer);
-    }
-
     /// Test that we correctly allocate two items
     #[test]
     fn alloc_two() {
@@ -391,16 +392,125 @@ mod tests {
     fn max_out() {
         let mut heap = new_heap();
         let layout = new_layout();
-        let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
+        let heap_size = 1000 - size_of::<BlockHeader>();
         let num_loops = heap_size / (size_of::<BlockHeader>() * 2);
         for _ in 0..num_loops {
             let res = unsafe { heap.allocate_next_fit(layout.clone()) };
-            assert!(res.is_ok())
+            assert!(res.is_ok());
         }
 
         let res = unsafe { heap.allocate_next_fit(layout.clone()) };
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), AllocateError::OutOfSpace);
+    }
+
+    /// Test that we allocate the entire heap with one alloc
+    #[test]
+    fn alloc_entire() {
+        let mut heap = new_heap();
+        let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
+        let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        dbg!(heap);
+        assert_eq!(
+            res.unwrap() as u64,
+            heap.bottom + size_of::<BlockHeader>() as u64
+        );
+    }
+
+    /// Test that we correctly deallocate one item
+    #[test]
+    fn dealloc_one() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        let res = unsafe { heap.dealloc_immediate_coalesce(res.unwrap()) };
+        assert!(res.is_ok());
+    }
+
+    /// Test that we correctly deallocate one item with two allocations then reuse the space
+    #[test]
+    fn dealloc_first() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let res = unsafe { heap.allocate_next_fit(layout.clone()) };
+        unsafe { heap.allocate_next_fit(layout.clone()).unwrap() };
+        assert!(res.is_ok());
+        let res = unsafe { heap.dealloc_immediate_coalesce(res.unwrap()) };
+        assert!(res.is_ok());
+        println!("{:#?}", heap);
+    }
+
+    /// Test that deallocating a bad ptr throws an error
+    #[test]
+    fn dealloc_bad_ptr() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        let res =
+            unsafe { heap.dealloc_immediate_coalesce(((res.unwrap() as u64) + 1) as *mut u8) };
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), AllocateError::InvalidPointer);
+    }
+
+    /// Test that if we allocate every spot then deallocate them all we have no fragmentation
+    #[test]
+    fn coalescing_forward() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
+        let num_loops = heap_size / (size_of::<BlockHeader>() * 2);
+        // save them
+        let mut ptrs = vec![];
+        for _ in 0..num_loops {
+            let res = unsafe { heap.allocate_next_fit(layout.clone()) };
+            assert!(res.is_ok());
+            ptrs.push(res.unwrap());
+        }
+        // dealloc
+        for ptr in ptrs {
+            unsafe { assert!(heap.dealloc_immediate_coalesce(ptr).is_ok()) };
+        }
+        // try to allocate the entire heap, should work since there should be no fragmentation
+        let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        assert_eq!(
+            res.unwrap() as u64,
+            heap.bottom + size_of::<BlockHeader>() as u64
+        );
+    }
+
+    /// Test that if we allocate every spot then deallocate them all backwards we have no fragmentation
+    #[test]
+    fn coalescing_backwards() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+        let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
+        let num_loops = heap_size / (size_of::<BlockHeader>() * 2);
+        // save them
+        let mut ptrs = vec![];
+        for _ in 0..num_loops {
+            let res = unsafe { heap.allocate_next_fit(layout.clone()) };
+            assert!(res.is_ok());
+            ptrs.push(res.unwrap());
+        }
+        // dealloc backwards
+        ptrs.reverse();
+        for ptr in ptrs {
+            unsafe { assert!(heap.dealloc_immediate_coalesce(ptr).is_ok()) };
+        }
+        // try to allocate the entire heap, should work since there should be no fragmentation
+        let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
+        let res = unsafe { heap.allocate_next_fit(layout) };
+        assert!(res.is_ok());
+        assert_eq!(
+            res.unwrap() as u64,
+            heap.bottom + size_of::<BlockHeader>() as u64
+        );
     }
 
     /// Test that creating header returns the correct bitflags
