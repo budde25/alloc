@@ -60,7 +60,7 @@ impl BlockAllocator {
         // heap start is the bottom
         self.bottom = heap_start;
 
-        self.current = Block::new(heap_start as *mut BlockHeader);
+        self.current = Block::from(heap_start);
 
         // subtract header size and the end header size
         let first_size = heap_size - HEADER_SIZE - HEADER_SIZE;
@@ -80,7 +80,7 @@ impl BlockAllocator {
     unsafe fn next(&mut self) {
         let next = self.current.next();
         if next.end() {
-            self.current = Block::new(self.bottom as *mut BlockHeader);
+            self.current = Block::from(self.bottom);
             self.previous_allocated = true;
         } else {
             let allocated = self.current.allocated();
@@ -239,6 +239,7 @@ fn round_up_eight(value: u64) -> u64 {
 
 mod header {
     use bitflags::bitflags;
+    use core::convert::From;
     use core::fmt::{self, Debug};
 
     /// A pointer to a block header and the block header itself
@@ -483,6 +484,18 @@ mod header {
         type IntoIter = BlockIterator;
         fn into_iter(self) -> Self::IntoIter {
             BlockIterator(self)
+        }
+    }
+
+    impl From<*mut u8> for Block {
+        fn from(ptr: *mut u8) -> Self {
+            unsafe { Self::new(ptr as *mut BlockHeader) }
+        }
+    }
+
+    impl From<u64> for Block {
+        fn from(ptr: u64) -> Self {
+            unsafe { Self::new(ptr as *mut BlockHeader) }
         }
     }
 
