@@ -1,16 +1,17 @@
-use bitflags::bitflags;
 use core::cmp::Eq;
 use core::fmt::Debug;
-use core::{alloc::Layout, debug_assert, fmt};
+use core::{alloc::Layout, fmt};
+use header::{Block, BlockHeader};
 use spin::Mutex;
 
-// static variable to panic if we try to init the allocator twice
+// Static variable to panic if we try to init the allocator twice
 #[doc(hidden)]
 static IS_INIT: Mutex<bool> = Mutex::new(false);
 
 /// The size of the block header
 const HEADER_SIZE: u64 = 8;
 
+// Required since it lives under a spinlock
 unsafe impl Send for BlockAllocator {}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -19,7 +20,9 @@ pub enum AllocateError {
     InvalidPointer,
 }
 
-/// A segmentation based allocator based off https://pages.cs.wisc.edu/~remzi/OSTEP/vm-freespace.pdf
+/// A segmentation based allocator
+///
+/// https://pages.cs.wisc.edu/~remzi/OSTEP/vm-freespace.pdf
 pub struct BlockAllocator {
     current: Block,
     bottom: u64,
@@ -27,13 +30,11 @@ pub struct BlockAllocator {
 }
 
 impl BlockAllocator {
-    /// Create a new empty allocator, must init before using
+    /// Create a new empty allocator
+    /// MUST INIT BEFORE USING
     pub const fn new() -> Self {
         Self {
-            current: Block {
-                ptr: 0 as *mut BlockHeader,
-                block: BlockHeader::empty(),
-            },
+            current: unsafe { Block::empty() },
             bottom: 0,
             previous_allocated: true,
         }
@@ -70,6 +71,12 @@ impl BlockAllocator {
         self.current.next().write(BlockHeader::HEAP_END);
     }
 
+    /// Advance to the next block
+    ///
+    /// Unsafety
+    ///
+    /// Requires the current block header to be valid
+    /// Requires the next block header to be valid
     unsafe fn next(&mut self) {
         let next = self.current.next();
         if next.end() {
@@ -83,17 +90,33 @@ impl BlockAllocator {
     }
 
     /// Get the next free block, that can fit an allocation of size (not including the block header)
+    ///
+    /// Unsafety
+    ///
+    /// Requires the current block header to be valid
+    /// Requires the next arbitrary number of block header to be valid
     unsafe fn next_free(&mut self, size: u64) -> Result<(), AllocateError> {
-        let start = self.current.ptr;
+        let start = self.current.ptr();
         while self.current.allocated() || self.current.size() < size {
             self.next();
-            if self.current.ptr == start {
+            if self.current.ptr() == start {
                 return Err(AllocateError::OutOfSpace);
             }
         }
         Ok(())
     }
 
+    /// Allocate using the next fit strategy
+    /// Next fit keeps track of position to allocate into the first space that
+    /// it can fit
+    ///
+    /// This function will panic if:
+    /// * It cannot find a spot to fit the allocation
+    /// * It is full
+    ///
+    /// # Safety
+    ///
+    /// Must pass a valid Layout
     pub unsafe fn allocate_next_fit(&mut self, layout: Layout) -> Result<*mut u8, AllocateError> {
         let size = round_up_eight(layout.size() as u64); // Must be a multiple of 8
 
@@ -117,6 +140,17 @@ impl BlockAllocator {
         Ok(data_start)
     }
 
+    /// Deallocate a preform immediate coalescing
+    /// Immediate coalescing will check to see if there is a free block in front or behind
+    /// it and will merge them together into a larger free block
+    ///
+    /// This function will panic is the pointer is not byte aligned
+    ///
+    /// # Safety
+    ///
+    /// * Must pass a valid pointer to the data that was allocated.
+    /// * The pointer must be byte aligned  
+    /// * Must not double free
     pub unsafe fn dealloc_immediate_coalesce(&mut self, ptr: *mut u8) -> Result<(), AllocateError> {
         // Ensure the pointer is valid to avoid undefined behavior
         if ptr as u64 % 8 != 0 {
@@ -131,7 +165,7 @@ impl BlockAllocator {
         // front
         // make sure next header doesn't say the previous is allocated
         let mut next = header.next();
-        if next.ptr as u64 != self.bottom {
+        if next.ptr() as u64 != self.bottom {
             if !next.allocated() {
                 total_size += next.size() + HEADER_SIZE;
             }
@@ -145,11 +179,11 @@ impl BlockAllocator {
             header = header.previous();
         }
 
-        // update the header and footer
+        // update the header and footer size
         header.write(BlockHeader::new(total_size, false, true));
         header.write_footer(BlockHeader::new(total_size, false, false));
 
-        // make sure that we don't save an invalid spot thanks to the coalescing
+        // make sure that we don't save a freed header due to backwards coalescing
         self.current = header;
 
         Ok(())
@@ -193,213 +227,341 @@ impl<T> Locked<T> {
     }
 }
 
-#[derive(Eq)]
-struct Block {
-    ptr: *mut BlockHeader,
-    block: BlockHeader,
-}
-
-impl Block {
-    unsafe fn new(ptr: *mut BlockHeader) -> Self {
-        Self {
-            ptr,
-            block: ptr.read_volatile(),
-        }
-    }
-
-    unsafe fn from_data_start(ptr: *mut u8) -> Self {
-        let header_ptr = (ptr as *mut BlockHeader).sub(1);
-        Self::new(header_ptr)
-    }
-
-    unsafe fn header(&self) -> BlockHeader {
-        self.block
-    }
-
-    unsafe fn footer(&self) -> BlockHeader {
-        self.block.footer(self.ptr as u64).read_volatile()
-    }
-
-    unsafe fn next(&self) -> Self {
-        Self::new(self.block.next(self.ptr as u64))
-    }
-
-    unsafe fn previous(&self) -> Self {
-        // previous size will assert for us
-        let previous_size = self.previous_size();
-        let ptr = ((self.ptr as u64 - previous_size) as *mut BlockHeader).sub(1);
-        Self::new(ptr)
-    }
-
-    unsafe fn previous_size(&self) -> u64 {
-        assert!(!self.previous_allocated());
-        let previous_footer = self.ptr.sub(1).read_volatile();
-        previous_footer.size()
-    }
-
-    unsafe fn ptr(&self) -> *const BlockHeader {
-        self.ptr
-    }
-
-    unsafe fn set_allocated(&mut self, allocated: bool) {
-        if self.block.allocated() != allocated {
-            self.block
-                .set(BlockHeader::CURRENT_BLOCK_ALLOCATED, allocated);
-            self.ptr.write_volatile(self.block);
-        }
-    }
-
-    unsafe fn set_previous_allocated(&mut self, previous_allocated: bool) {
-        if self.block.previous_allocated() != previous_allocated {
-            self.block
-                .set(BlockHeader::PREVIOUS_BLOCK_ALLOCATED, previous_allocated);
-            self.ptr.write_volatile(self.block);
-        }
-    }
-
-    unsafe fn write(&mut self, header: BlockHeader) {
-        self.ptr.write_volatile(header);
-        self.block = header;
-    }
-
-    unsafe fn write_footer(&mut self, footer: BlockHeader) {
-        self.block.footer(self.ptr as u64).write_volatile(footer);
-    }
-
-    unsafe fn data_start(&self) -> *mut u8 {
-        self.ptr.add(1) as *mut u8
-    }
-
-    unsafe fn size(&self) -> u64 {
-        self.block.size()
-    }
-
-    unsafe fn allocated(&self) -> bool {
-        self.block.allocated()
-    }
-
-    unsafe fn previous_allocated(&self) -> bool {
-        self.block.previous_allocated()
-    }
-
-    unsafe fn end(&self) -> bool {
-        self.block.end()
-    }
-}
-
-impl Debug for Block {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Hex(u64);
-        impl Debug for Hex {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{:#X}", self.0)
-            }
-        }
-
-        let mut ob = f.debug_struct("Block");
-        unsafe {
-            ob.field("ptr", &Hex(self.ptr as u64));
-            ob.field("size", &self.size());
-            ob.field("allocated", &self.allocated());
-            ob.field("previous_allocated", &self.previous_allocated());
-        }
-        ob.finish()
-    }
-}
-
-impl PartialEq for Block {
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-impl IntoIterator for Block {
-    type Item = Self;
-    type IntoIter = BlockIterator;
-    fn into_iter(self) -> Self::IntoIter {
-        BlockIterator(self)
-    }
-}
-
-struct BlockIterator(Block);
-
-impl Iterator for BlockIterator {
-    type Item = Block;
-    fn next(&mut self) -> Option<Self::Item> {
-        use core::mem::replace;
-
-        if self.0.block.end() {
-            return None;
-        }
-        let next = unsafe { self.0.next() };
-        let result = replace(&mut self.0, next);
-        Some(result)
-    }
-}
-
-bitflags! {
-    /// This represents the header of each block of memory that we allocate, it will also be the footer
-    /// to free block. The 3 least significant bits are unused for the size since it will be always be a multiple of 8,
-    /// Instead we will store metadata about the block there.
-    #[repr(C)]
-    struct BlockHeader: u64 {
-        /// The current block is allocated
-        const CURRENT_BLOCK_ALLOCATED = 0b1;
-        /// The previous block is allocated
-        const PREVIOUS_BLOCK_ALLOCATED = 0b10;
-        /// Represents the end of available memory
-        const HEAP_END = 0b100;
-    }
-}
-
-impl BlockHeader {
-    /// Create a new Block header
-    fn new(size: u64, current: bool, previous: bool) -> Self {
-        // SAFETY the other bits represent the size to they are a valid representation
-        let mut size_status = unsafe { Self::from_bits_unchecked(size) };
-        size_status.set(Self::CURRENT_BLOCK_ALLOCATED, current); // current bit
-        size_status.set(Self::PREVIOUS_BLOCK_ALLOCATED, previous); // previous bit
-        size_status
-    }
-
-    fn next(&self, current_position: u64) -> *mut Self {
-        unsafe { ((current_position + self.size()) as *mut BlockHeader).add(1) }
-    }
-
-    fn footer(&self, current_position: u64) -> *mut Self {
-        // debug_assert!(self.previous_allocated());
-        (current_position + self.size()) as *mut BlockHeader
-    }
-
-    /// Returns the size of the allocated data (without taking into account the header), will always be a multiple of 8
-    fn size(&self) -> u64 {
-        let size = self.bits & (u64::MAX - 7); // Ex 0b1111_1111_1111_1000 for 32 bit, 2 more bytes of leading 1s for 64bit
-        debug_assert!(size % 8 == 0);
-        size
-    }
-
-    /// Returns true if we have reached the end of the heap, false otherwise
-    fn end(&self) -> bool {
-        self.bits == 0b100
-    }
-
-    fn allocated(&self) -> bool {
-        self.contains(Self::CURRENT_BLOCK_ALLOCATED)
-    }
-
-    fn previous_allocated(&self) -> bool {
-        self.contains(Self::PREVIOUS_BLOCK_ALLOCATED)
-    }
-}
-
 /// panics if it would rounds above u64::max or round_to is 0
 fn round_to(value: u64, round_to: u64) -> u64 {
-    value + (round_to - 1) & !(round_to - 1)
+    (value + (round_to - 1)) & !(round_to - 1)
 }
 
 /// Convenience method that rounds up to the nearest multiple of 8
 fn round_up_eight(value: u64) -> u64 {
     round_to(value, 8)
+}
+
+mod header {
+    use bitflags::bitflags;
+    use core::fmt::{self, Debug};
+
+    /// A pointer to a block header and the block header itself
+    #[derive(Eq)]
+    pub struct Block {
+        ptr: *mut BlockHeader,
+        block: BlockHeader,
+    }
+
+    impl Block {
+        /// Create an empty Block
+        ///
+        /// # Unsafety
+        ///
+        /// INVALID state, use only for before you init it
+        pub const unsafe fn empty() -> Self {
+            Self {
+                ptr: 0 as *mut BlockHeader,
+                block: BlockHeader::empty(),
+            }
+        }
+
+        /// Create a new Block from a BlockHeader pointer
+        ///
+        /// # Unsafety
+        ///
+        /// Must be a valid pointer to a Block Header
+        pub unsafe fn new(ptr: *mut BlockHeader) -> Self {
+            Self {
+                ptr,
+                block: ptr.read_volatile(),
+            }
+        }
+
+        /// Create a new Block from the start of data
+        /// Useful for dealloc
+        ///
+        /// # Unsafety
+        ///
+        /// Must be a valid pointer to 1 byte ahead of a Block Header
+        pub unsafe fn from_data_start(ptr: *mut u8) -> Self {
+            let header_ptr = (ptr as *mut BlockHeader).sub(1);
+            Self::new(header_ptr)
+        }
+
+        /// Get the header block
+        ///
+        /// # Unsafety
+        ///
+        /// Must contain valid pointer to a Block Header
+        #[allow(dead_code)]
+        pub unsafe fn header(&self) -> BlockHeader {
+            self.block
+        }
+
+        /// Get the footer block
+        ///
+        /// # Unsafety
+        ///
+        /// Must contain valid pointer to a Block Header
+        /// Must not be allocated
+        #[allow(dead_code)]
+        pub unsafe fn footer(&self) -> BlockHeader {
+            assert!(!self.allocated());
+            self.block.footer(self.ptr as u64).read_volatile()
+        }
+
+        /// Get the next block
+        ///
+        /// # Unsafety
+        ///
+        /// Requires a valid Block Header
+        /// Requires the next Block Header to be valid
+        pub unsafe fn next(&self) -> Self {
+            Self::new(self.block.next(self.ptr as u64))
+        }
+
+        /// Get the previous block
+        ///
+        /// # Safety
+        ///
+        /// Must not be called when previous block in not free
+        ///
+        /// # Unsafety
+        ///
+        /// Requires a previous block to be valid
+        /// Requires a footer to have been set
+        pub unsafe fn previous(&self) -> Self {
+            // previous size will assert for us
+            let previous_size = self.previous_size();
+            let ptr = ((self.ptr as u64 - previous_size) as *mut BlockHeader).sub(1);
+            Self::new(ptr)
+        }
+
+        /// Get the previous block size
+        ///
+        /// # Safety
+        ///
+        /// Must not be called when previous block in not free
+        ///
+        /// # Unsafety
+        ///
+        /// Requires a footer to have been set
+        pub unsafe fn previous_size(&self) -> u64 {
+            assert!(!self.previous_allocated());
+            let previous_footer = self.ptr.sub(1).read_volatile();
+            previous_footer.size()
+        }
+
+        /// Get the pointer
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn ptr(&self) -> *const BlockHeader {
+            self.ptr
+        }
+
+        /// Set if the current block is allocated
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        #[allow(dead_code)]
+        pub unsafe fn set_allocated(&mut self, allocated: bool) {
+            if self.block.allocated() != allocated {
+                self.block
+                    .set(BlockHeader::CURRENT_BLOCK_ALLOCATED, allocated);
+                self.ptr.write_volatile(self.block);
+            }
+        }
+
+        /// Set if the previous block is allocated
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn set_previous_allocated(&mut self, previous_allocated: bool) {
+            if self.block.previous_allocated() != previous_allocated {
+                self.block
+                    .set(BlockHeader::PREVIOUS_BLOCK_ALLOCATED, previous_allocated);
+                self.ptr.write_volatile(self.block);
+            }
+        }
+
+        /// Write a block header to the current pointer position
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header pointer to be valid
+        pub unsafe fn write(&mut self, header: BlockHeader) {
+            self.ptr.write_volatile(header);
+            self.block = header;
+        }
+
+        /// Write a block header to the footer position
+        ///
+        /// Will panic if called while the block is allocated
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header pointer to be valid
+        pub unsafe fn write_footer(&mut self, footer: BlockHeader) {
+            assert!(!self.allocated());
+            self.block.footer(self.ptr as u64).write_volatile(footer);
+        }
+
+        /// Get a pointer to the data start
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn data_start(&self) -> *mut u8 {
+            self.ptr.add(1) as *mut u8
+        }
+
+        /// Get the size of the block (without he header)
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn size(&self) -> u64 {
+            self.block.size()
+        }
+
+        /// Get if the current block is allocated
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn allocated(&self) -> bool {
+            self.block.allocated()
+        }
+
+        /// Get if the previous block is allocated
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn previous_allocated(&self) -> bool {
+            self.block.previous_allocated()
+        }
+
+        /// Get if this is the end block
+        ///
+        /// # Unsafety
+        ///
+        /// Requires the block header to be valid
+        pub unsafe fn end(&self) -> bool {
+            self.block.end()
+        }
+    }
+
+    impl Debug for Block {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            struct Hex(u64);
+            impl Debug for Hex {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    write!(f, "{:#X}", self.0)
+                }
+            }
+
+            let mut item = f.debug_struct("Block");
+            unsafe {
+                item.field("ptr", &Hex(self.ptr as u64));
+                item.field("size", &self.size());
+                item.field("allocated", &self.allocated());
+                item.field("previous_allocated", &self.previous_allocated());
+            }
+            item.finish()
+        }
+    }
+
+    impl PartialEq for Block {
+        fn eq(&self, other: &Self) -> bool {
+            self.ptr == other.ptr
+        }
+    }
+
+    impl IntoIterator for Block {
+        type Item = Self;
+        type IntoIter = BlockIterator;
+        fn into_iter(self) -> Self::IntoIter {
+            BlockIterator(self)
+        }
+    }
+
+    /// The iterator of the Block
+    /// Replace the block with the next one
+    pub struct BlockIterator(Block);
+
+    impl Iterator for BlockIterator {
+        type Item = Block;
+        fn next(&mut self) -> Option<Self::Item> {
+            use core::mem::replace;
+
+            if self.0.block.end() {
+                return None;
+            }
+            let next = unsafe { self.0.next() };
+            let result = replace(&mut self.0, next);
+            Some(result)
+        }
+    }
+
+    bitflags! {
+        /// This represents the header of each block of memory that we allocate, it will also be the footer
+        /// to free block. The 3 least significant bits are unused for the size since it will be always be a multiple of 8,
+        /// Instead we will store metadata about the block there.
+        #[repr(C)]
+        pub struct BlockHeader: u64 {
+            /// The current block is allocated
+            const CURRENT_BLOCK_ALLOCATED = 0b1;
+            /// The previous block is allocated
+            const PREVIOUS_BLOCK_ALLOCATED = 0b10;
+            /// Represents the end of available memory
+            const HEAP_END = 0b100;
+        }
+    }
+
+    impl BlockHeader {
+        /// Create a new Block header
+        pub fn new(size: u64, current: bool, previous: bool) -> Self {
+            // SAFETY the other bits represent the size to they are a valid representation
+            let mut size_status = unsafe { Self::from_bits_unchecked(size) };
+            size_status.set(Self::CURRENT_BLOCK_ALLOCATED, current); // current bit
+            size_status.set(Self::PREVIOUS_BLOCK_ALLOCATED, previous); // previous bit
+            size_status
+        }
+
+        /// Get a pointer to the next block header given its current header pointer
+        fn next(&self, current_position: u64) -> *mut Self {
+            unsafe { ((current_position + self.size()) as *mut BlockHeader).add(1) }
+        }
+
+        /// Get a pointer to the block footer given its current header pointer
+        fn footer(&self, current_position: u64) -> *mut Self {
+            // debug_assert!(self.previous_allocated());
+            (current_position + self.size()) as *mut BlockHeader
+        }
+
+        /// Get the size of the block header (without taking into account the header), will always be a multiple of 8
+        fn size(&self) -> u64 {
+            let size = self.bits & (u64::MAX - 7); // Ex 0b1111_1111_1111_1000 for 32 bit, 2 more bytes of leading 1s for 64bit
+            debug_assert!(size % 8 == 0);
+            size
+        }
+
+        /// Get if this is the end of the heap
+        fn end(&self) -> bool {
+            self.bits == 0b100
+        }
+
+        /// Get if this header is allocated
+        fn allocated(&self) -> bool {
+            self.contains(Self::CURRENT_BLOCK_ALLOCATED)
+        }
+
+        /// Get if this is the end of the heap
+        fn previous_allocated(&self) -> bool {
+            self.contains(Self::PREVIOUS_BLOCK_ALLOCATED)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -623,15 +785,6 @@ mod tests {
             res.unwrap() as u64,
             heap.bottom + size_of::<BlockHeader>() as u64
         );
-    }
-
-    /// Test that creating header returns the correct bitflags
-    #[test]
-    fn test_header() {
-        let header = unsafe { BlockHeader::from_bits_unchecked(27) };
-        assert!(header.allocated());
-        assert!(header.previous_allocated());
-        assert_eq!(header.size(), 24);
     }
 
     /// Test the we always round up to the nearest 8
