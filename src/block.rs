@@ -1,6 +1,6 @@
+use core::alloc::Layout;
 use core::cmp::Eq;
-use core::fmt::Debug;
-use core::{alloc::Layout, fmt};
+use core::fmt::{self, Debug, Display};
 use header::{Block, BlockHeader};
 use spin::Mutex;
 
@@ -15,9 +15,18 @@ const HEADER_SIZE: u64 = 8;
 unsafe impl Send for BlockAllocator {}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum AllocateError {
+pub enum AllocatorError {
     OutOfSpace,
     InvalidPointer,
+}
+
+impl Display for AllocatorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            AllocatorError::InvalidPointer => write!(f, "Pointer must be a multiple of 8"),
+            AllocatorError::OutOfSpace => write!(f, "No room left in heap"),
+        }
+    }
 }
 
 /// A segmentation based allocator
@@ -95,12 +104,12 @@ impl BlockAllocator {
     ///
     /// Requires the current block header to be valid
     /// Requires the next arbitrary number of block header to be valid
-    unsafe fn next_free(&mut self, size: u64) -> Result<(), AllocateError> {
+    unsafe fn next_free(&mut self, size: u64) -> Result<(), AllocatorError> {
         let start = self.current.ptr();
         while self.current.allocated() || self.current.size() < size {
             self.next();
             if self.current.ptr() == start {
-                return Err(AllocateError::OutOfSpace);
+                return Err(AllocatorError::OutOfSpace);
             }
         }
         Ok(())
@@ -117,7 +126,7 @@ impl BlockAllocator {
     /// # Safety
     ///
     /// Must pass a valid Layout
-    pub unsafe fn allocate_next_fit(&mut self, layout: Layout) -> Result<*mut u8, AllocateError> {
+    pub unsafe fn allocate_next_fit(&mut self, layout: Layout) -> Result<*mut u8, AllocatorError> {
         let size = round_up_eight(layout.size() as u64); // Must be a multiple of 8
 
         self.next_free(size)?; // get us to a free block, that can fit our allocation
@@ -151,10 +160,13 @@ impl BlockAllocator {
     /// * Must pass a valid pointer to the data that was allocated.
     /// * The pointer must be byte aligned  
     /// * Must not double free
-    pub unsafe fn dealloc_immediate_coalesce(&mut self, ptr: *mut u8) -> Result<(), AllocateError> {
+    pub unsafe fn dealloc_immediate_coalesce(
+        &mut self,
+        ptr: *mut u8,
+    ) -> Result<(), AllocatorError> {
         // Ensure the pointer is valid to avoid undefined behavior
         if ptr as u64 % 8 != 0 {
-            return Err(AllocateError::InvalidPointer);
+            return Err(AllocatorError::InvalidPointer);
         }
 
         let mut header = Block::from_data_start(ptr); // This ptr points to the start of the data, get us to the block header
@@ -656,7 +668,7 @@ mod tests {
 
         let res = unsafe { heap.allocate_next_fit(layout.clone()) };
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), AllocateError::OutOfSpace);
+        assert_eq!(res.unwrap_err(), AllocatorError::OutOfSpace);
     }
 
     /// Test that we allocate the entire heap with one alloc
@@ -706,7 +718,7 @@ mod tests {
         let res =
             unsafe { heap.dealloc_immediate_coalesce(((res.unwrap() as u64) + 1) as *mut u8) };
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), AllocateError::InvalidPointer);
+        assert_eq!(res.unwrap_err(), AllocatorError::InvalidPointer);
     }
 
     /// Test that if we allocate every spot then deallocate them all we have no fragmentation
