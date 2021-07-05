@@ -1,4 +1,4 @@
-//! A segmented allocator
+//! A free list allocator
 
 #![no_std]
 #![deny(
@@ -18,11 +18,11 @@ extern crate alloc;
 mod block;
 
 use alloc::alloc::{GlobalAlloc, Layout};
-use block::{BlockAllocator, Locked};
+use block::Locked;
 use core::ptr;
 
 /// An allocator type, the main allocator behind a Mutex
-pub type Allocator = Locked<BlockAllocator>;
+pub type Allocator = Locked;
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -38,6 +38,3 @@ unsafe impl GlobalAlloc for Allocator {
         }
     }
 }
-
-#[cfg(test)]
-mod test;

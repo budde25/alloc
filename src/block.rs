@@ -221,20 +221,23 @@ impl Debug for BlockAllocator {
 
 /// Allows putting a type behind a Mutex
 #[derive(Debug)]
-pub struct Locked<T> {
-    inner: Mutex<T>,
+pub struct Locked {
+    inner: Mutex<BlockAllocator>,
 }
 
-impl<T> Locked<T> {
+impl Locked {
     /// Create a new Mutex locked type
-    pub const fn new(inner: T) -> Self {
+    pub const fn new() -> Self {
         Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(BlockAllocator::new()),
         }
     }
 
-    /// Get the interior
-    pub fn lock(&self) -> spin::MutexGuard<T> {
+    pub unsafe fn init(&mut self, heap_start: u64, heap_size: u64) {
+        self.inner.lock().init(heap_start, heap_size)
+    }
+
+    pub fn lock(&self) -> spin::MutexGuard<BlockAllocator> {
         self.inner.lock()
     }
 }
