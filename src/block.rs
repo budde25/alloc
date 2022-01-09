@@ -140,10 +140,12 @@ impl BlockAllocator {
         let data_start = self.current.data_start();
 
         let mut next = self.current.next();
-        if !next.end() {
+        if !next.end() && !next.allocated() {
             let updated_size = saved_size - (size + HEADER_SIZE);
             next.write(BlockHeader::new(updated_size, false, true));
             self.current = next;
+        } else if !next.end() && next.allocated() {
+            next.set_previous_allocated(true);
         }
 
         Ok(data_start)
@@ -596,6 +598,7 @@ mod header {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use alloc::vec::Vec;
     use core::alloc::Layout;
     use core::mem::{align_of, size_of};
     extern crate std;
@@ -813,6 +816,24 @@ mod tests {
             res.unwrap() as u64,
             heap.bottom + size_of::<BlockHeader>() as u64
         );
+    }
+
+    #[test]
+    fn fill_and_free_first() {
+        let mut heap = new_heap();
+        let layout = new_layout();
+
+        // allocate 30
+        let first = unsafe { heap.allocate_next_fit(layout.clone()).unwrap() };
+        for _ in 0..29 {
+            unsafe { heap.allocate_next_fit(layout.clone()).unwrap() };
+        }
+
+        // free our first one
+        unsafe { assert!(heap.dealloc_immediate_coalesce(first).is_ok()) };
+
+        // realocate, I would assume this take the place of the first
+        unsafe { heap.allocate_next_fit(layout.clone()).unwrap() };
     }
 
     /// Test the we always round up to the nearest 8
