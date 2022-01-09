@@ -43,7 +43,7 @@ impl BlockAllocator {
     /// MUST INIT BEFORE USING
     pub const fn new() -> Self {
         Self {
-            current: unsafe { Block::empty() },
+            current: unsafe { Block::new(0 as *mut BlockHeader) },
             bottom: 0,
             previous_allocated: true,
         }
@@ -214,8 +214,8 @@ impl Debug for BlockAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut list = f.debug_list();
 
-        let start_block = unsafe { Block::new(self.bottom as *mut BlockHeader) };
-        list.entries(start_block);
+        // let start_block = unsafe { Block::new(self.bottom as *mut BlockHeader) };
+        // list.entries(start_block);
 
         list.finish()
     }
@@ -258,37 +258,35 @@ mod header {
     use bitflags::bitflags;
     use core::convert::From;
     use core::fmt::{self, Debug};
+    use core::ops::{Deref, DerefMut};
 
     /// A pointer to a block header and the block header itself
-    #[derive(Eq)]
+    #[derive(PartialEq, Eq)]
     pub struct Block {
         ptr: *mut BlockHeader,
-        block: BlockHeader,
+    }
+
+    impl Deref for Block {
+        type Target = BlockHeader;
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.ptr }
+        }
+    }
+
+    impl DerefMut for Block {
+        fn deref_mut(self: &mut Block) -> &mut Self::Target {
+            unsafe { &mut *self.ptr }
+        }
     }
 
     impl Block {
-        /// Create an empty Block
-        ///
-        /// # Unsafety
-        ///
-        /// INVALID state, use only for before you init it
-        pub const unsafe fn empty() -> Self {
-            Self {
-                ptr: 0 as *mut BlockHeader,
-                block: BlockHeader::empty(),
-            }
-        }
-
         /// Create a new Block from a BlockHeader pointer
         ///
         /// # Unsafety
         ///
         /// Must be a valid pointer to a Block Header
-        pub unsafe fn new(ptr: *mut BlockHeader) -> Self {
-            Self {
-                ptr,
-                block: ptr.read_volatile(),
-            }
+        pub const fn new(ptr: *mut BlockHeader) -> Self {
+            Self { ptr }
         }
 
         /// Create a new Block from the start of data
@@ -302,16 +300,6 @@ mod header {
             Self::new(header_ptr)
         }
 
-        /// Get the header block
-        ///
-        /// # Unsafety
-        ///
-        /// Must contain valid pointer to a Block Header
-        #[allow(dead_code)]
-        pub unsafe fn header(&self) -> BlockHeader {
-            self.block
-        }
-
         /// Get the footer block
         ///
         /// # Unsafety
@@ -321,7 +309,7 @@ mod header {
         #[allow(dead_code)]
         pub unsafe fn footer(&self) -> BlockHeader {
             assert!(!self.allocated());
-            self.block.footer(self.ptr as u64).read_volatile()
+            *self.deref().footer(self.ptr as u64)
         }
 
         /// Get the next block
@@ -331,7 +319,7 @@ mod header {
         /// Requires a valid Block Header
         /// Requires the next Block Header to be valid
         pub unsafe fn next(&self) -> Self {
-            Self::new(self.block.next(self.ptr as u64))
+            Self::new(self.deref().next(self.ptr as u64))
         }
 
         /// Get the previous block
@@ -382,10 +370,9 @@ mod header {
         /// Requires the block header to be valid
         #[allow(dead_code)]
         pub unsafe fn set_allocated(&mut self, allocated: bool) {
-            if self.block.allocated() != allocated {
-                self.block
+            if self.deref().allocated() != allocated {
+                self.deref_mut()
                     .set(BlockHeader::CURRENT_BLOCK_ALLOCATED, allocated);
-                self.ptr.write_volatile(self.block);
             }
         }
 
@@ -395,10 +382,9 @@ mod header {
         ///
         /// Requires the block header to be valid
         pub unsafe fn set_previous_allocated(&mut self, previous_allocated: bool) {
-            if self.block.previous_allocated() != previous_allocated {
-                self.block
+            if self.deref().previous_allocated() != previous_allocated {
+                self.deref_mut()
                     .set(BlockHeader::PREVIOUS_BLOCK_ALLOCATED, previous_allocated);
-                self.ptr.write_volatile(self.block);
             }
         }
 
@@ -409,7 +395,6 @@ mod header {
         /// Requires the block header pointer to be valid
         pub unsafe fn write(&mut self, header: BlockHeader) {
             self.ptr.write_volatile(header);
-            self.block = header;
         }
 
         /// Write a block header to the footer position
@@ -421,7 +406,7 @@ mod header {
         /// Requires the block header pointer to be valid
         pub unsafe fn write_footer(&mut self, footer: BlockHeader) {
             assert!(!self.allocated());
-            self.block.footer(self.ptr as u64).write_volatile(footer);
+            (*self.ptr).footer(self.ptr as u64).write_volatile(footer);
         }
 
         /// Get a pointer to the data start
@@ -439,7 +424,7 @@ mod header {
         ///
         /// Requires the block header to be valid
         pub unsafe fn size(&self) -> u64 {
-            self.block.size()
+            self.deref().size()
         }
 
         /// Get if the current block is allocated
@@ -448,7 +433,7 @@ mod header {
         ///
         /// Requires the block header to be valid
         pub unsafe fn allocated(&self) -> bool {
-            self.block.allocated()
+            self.deref().allocated()
         }
 
         /// Get if the previous block is allocated
@@ -457,7 +442,7 @@ mod header {
         ///
         /// Requires the block header to be valid
         pub unsafe fn previous_allocated(&self) -> bool {
-            self.block.previous_allocated()
+            self.deref().previous_allocated()
         }
 
         /// Get if this is the end block
@@ -466,7 +451,7 @@ mod header {
         ///
         /// Requires the block header to be valid
         pub unsafe fn end(&self) -> bool {
-            self.block.end()
+            self.deref().end()
         }
     }
 
@@ -490,47 +475,15 @@ mod header {
         }
     }
 
-    impl PartialEq for Block {
-        fn eq(&self, other: &Self) -> bool {
-            self.ptr == other.ptr
-        }
-    }
-
-    impl IntoIterator for Block {
-        type Item = Self;
-        type IntoIter = BlockIterator;
-        fn into_iter(self) -> Self::IntoIter {
-            BlockIterator(self)
-        }
-    }
-
     impl From<*mut u8> for Block {
         fn from(ptr: *mut u8) -> Self {
-            unsafe { Self::new(ptr as *mut BlockHeader) }
+            Self::new(ptr as *mut BlockHeader)
         }
     }
 
     impl From<u64> for Block {
         fn from(ptr: u64) -> Self {
-            unsafe { Self::new(ptr as *mut BlockHeader) }
-        }
-    }
-
-    /// The iterator of the Block
-    /// Replace the block with the next one
-    pub struct BlockIterator(Block);
-
-    impl Iterator for BlockIterator {
-        type Item = Block;
-        fn next(&mut self) -> Option<Self::Item> {
-            use core::mem::replace;
-
-            if self.0.block.end() {
-                return None;
-            }
-            let next = unsafe { self.0.next() };
-            let result = replace(&mut self.0, next);
-            Some(result)
+            Self::new(ptr as *mut BlockHeader)
         }
     }
 
@@ -579,7 +532,7 @@ mod header {
 
         /// Get if this is the end of the heap
         fn end(&self) -> bool {
-            self.bits == 0b100
+            self.contains(Self::HEAP_END)
         }
 
         /// Get if this header is allocated
