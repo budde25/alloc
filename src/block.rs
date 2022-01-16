@@ -371,7 +371,6 @@ mod header {
                 (self.ptr as *mut u8).sub(previous_total_size as usize) as *mut BlockHeader
             };
             let prev = unsafe { Self::from_header(ptr) };
-            debug_assert!(prev.data_size() != 0);
             prev
         }
 
