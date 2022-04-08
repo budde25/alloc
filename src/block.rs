@@ -55,9 +55,13 @@ impl BlockAllocator {
     ///
     /// # Safety
     ///
-    /// Must provide valid pointers the the start and the end of the heap
+    /// Must provide valid and aligned pointers the the start and the end of the heap
     /// This is not checked so it is on you to get it right.
     pub unsafe fn init(&mut self, heap_start: u64, heap_size: u64) {
+        if heap_start % 8 != 0 || heap_size % 8 != 0 {
+            panic!("must be aligned")
+        }
+
         // Disallow double init
         {
             let mut is_init = IS_INIT.lock();
@@ -493,7 +497,7 @@ mod tests {
     /// Create a new heap, aka a box
     fn new_heap() -> BlockAllocator {
         const HEAP_SIZE: usize = 1000;
-        let heap_space = Box::into_raw(Box::new([0u8; HEAP_SIZE]));
+        let heap_space = Box::into_raw(Box::new([0u64; HEAP_SIZE / 8]));
 
         let mut heap = BlockAllocator::new();
         unsafe { heap.init(heap_space as u64, HEAP_SIZE as u64) };
