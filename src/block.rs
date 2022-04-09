@@ -1,12 +1,14 @@
 use core::alloc::Layout;
 use core::cmp::Eq;
 use core::fmt::{self, Debug, Display};
+use core::sync::atomic::AtomicBool;
 use header::{Block, BlockHeader};
 use spin::Mutex;
+use sptr::Strict;
 
 // Static variable to panic if we try to init the allocator twice
 #[doc(hidden)]
-static IS_INIT: Mutex<bool> = Mutex::new(false);
+static IS_INIT: AtomicBool = AtomicBool::new(false);
 
 /// The size of the block header
 const HEADER_SIZE: u64 = 8;
@@ -35,7 +37,7 @@ impl Display for AllocatorError {
 #[derive(Clone)]
 pub struct BlockAllocator {
     current: Block,
-    start: u64,
+    start: *const u8,
     previous_allocated: bool,
 }
 
@@ -45,7 +47,7 @@ impl BlockAllocator {
     pub const fn new() -> Self {
         Self {
             current: unsafe { Block::from_header(0 as *mut BlockHeader) },
-            start: 0,
+            start: sptr::invalid(0),
             previous_allocated: true,
         }
     }
@@ -57,20 +59,17 @@ impl BlockAllocator {
     ///
     /// Must provide valid and aligned pointers the the start and the end of the heap
     /// This is not checked so it is on you to get it right.
-    pub unsafe fn init(&mut self, heap_start: u64, heap_size: u64) {
-        if heap_start % 8 != 0 || heap_size % 8 != 0 {
-            panic!("must be aligned")
+    pub unsafe fn init(&mut self, heap_start: *mut u8, heap_size: u64) {
+        if heap_start.addr() % 8 != 0 || heap_size % 8 != 0 {
+            panic!("Heap start must be aligned and heap size must be aligned")
         }
 
         // Disallow double init
-        {
-            let mut is_init = IS_INIT.lock();
-            if *is_init {
-                #[cfg(not(test))]
-                panic!("Allocator has already been initialized, can only initialize once")
-            }
-            *is_init = true;
+        if IS_INIT.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            #[cfg(not(test))]
+            panic!("Allocator has already been initialized, can only initialize once")
         }
+
         // heap start is the bottom
         self.start = heap_start;
 
@@ -266,7 +265,7 @@ impl Locked {
         }
     }
 
-    pub unsafe fn init(&mut self, heap_start: u64, heap_size: u64) {
+    pub unsafe fn init(&mut self, heap_start: *mut u8, heap_size: u64) {
         self.inner.lock().init(heap_start, heap_size)
     }
 
@@ -500,8 +499,8 @@ mod tests {
         let heap_space = Box::into_raw(Box::new([0u64; HEAP_SIZE / 8]));
 
         let mut heap = BlockAllocator::new();
-        unsafe { heap.init(heap_space as u64, HEAP_SIZE as u64) };
-        assert_eq!(heap.start, heap_space as u64);
+        unsafe { heap.init(heap_space as *mut u8, HEAP_SIZE as u64) };
+        assert_eq!(heap.start.addr(), heap_space.addr());
         heap
     }
 
@@ -518,8 +517,8 @@ mod tests {
         let res = heap.allocate_next_fit(layout);
         assert!(res.is_ok());
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 
@@ -530,8 +529,8 @@ mod tests {
         let layout = Layout::from_size_align(size_of::<u64>(), 1).unwrap();
         let res = heap.allocate_next_fit(layout);
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 
@@ -545,8 +544,8 @@ mod tests {
 
         let ptr = heap.allocate_next_fit(layout.clone()).unwrap();
         assert_eq!(
-            ptr as u64,
-            heap.start + (size_of::<BlockHeader>() * 3) as u64
+            ptr.addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>() * 3).addr()
         );
     }
 
@@ -574,8 +573,8 @@ mod tests {
         let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
         let res = heap.allocate_next_fit(layout);
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 
@@ -634,8 +633,8 @@ mod tests {
         let res = heap.allocate_next_fit(layout);
         assert!(res.is_ok());
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 
@@ -662,8 +661,8 @@ mod tests {
         let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
         let res = heap.allocate_next_fit(layout);
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 
@@ -695,8 +694,8 @@ mod tests {
         let layout = Layout::from_size_align(heap_size, align_of::<BlockHeader>()).unwrap();
         let res = heap.allocate_next_fit(layout);
         assert_eq!(
-            res.unwrap() as u64,
-            heap.start + size_of::<BlockHeader>() as u64
+            res.unwrap().addr(),
+            heap.start.wrapping_add(size_of::<BlockHeader>()).addr()
         );
     }
 

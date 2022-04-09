@@ -9,6 +9,7 @@
     unused_import_braces,
     unused_qualifications
 )]
+#![allow(unstable_name_collisions)]
 
 extern crate alloc;
 
