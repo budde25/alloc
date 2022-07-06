@@ -373,8 +373,8 @@ mod header {
             let ptr = unsafe {
                 (self.ptr as *mut u8).sub(previous_total_size as usize) as *mut BlockHeader
             };
-            let prev = unsafe { Self::from_header(ptr) };
-            prev
+            
+            unsafe { Self::from_header(ptr) }
         }
 
         /// Get the previous block data size
@@ -540,9 +540,9 @@ mod tests {
         let mut heap = new_heap();
         let layout = new_layout();
 
-        heap.allocate_next_fit(layout.clone()).unwrap();
+        heap.allocate_next_fit(layout).unwrap();
 
-        let ptr = heap.allocate_next_fit(layout.clone()).unwrap();
+        let ptr = heap.allocate_next_fit(layout).unwrap();
         assert_eq!(
             ptr.addr(),
             heap.start.wrapping_add(size_of::<BlockHeader>() * 3).addr()
@@ -557,11 +557,11 @@ mod tests {
         let heap_size = 1000 - size_of::<BlockHeader>();
         let num_loops = heap_size / (size_of::<BlockHeader>() * 2);
         for _ in 0..num_loops {
-            let res = heap.allocate_next_fit(layout.clone());
+            let res = heap.allocate_next_fit(layout);
             assert!(res.is_ok());
         }
 
-        let res = heap.allocate_next_fit(layout.clone());
+        let res = heap.allocate_next_fit(layout);
         assert_eq!(res.unwrap_err(), AllocatorError::OutOfSpace);
     }
 
@@ -593,8 +593,8 @@ mod tests {
     fn dealloc_first() {
         let mut heap = new_heap();
         let layout = new_layout();
-        let res = heap.allocate_next_fit(layout.clone());
-        heap.allocate_next_fit(layout.clone()).unwrap();
+        let res = heap.allocate_next_fit(layout);
+        heap.allocate_next_fit(layout).unwrap();
         let res = heap.dealloc_immediate_coalesce(res.unwrap());
         assert!(res.is_ok());
     }
@@ -620,7 +620,7 @@ mod tests {
         // save them
         let mut ptrs = vec![];
         for _ in 0..num_loops {
-            let res = heap.allocate_next_fit(layout.clone());
+            let res = heap.allocate_next_fit(layout);
             assert!(res.is_ok());
             ptrs.push(res.unwrap());
         }
@@ -648,7 +648,7 @@ mod tests {
         // save them
         let mut ptrs = vec![];
         for _ in 0..num_loops {
-            let res = heap.allocate_next_fit(layout.clone());
+            let res = heap.allocate_next_fit(layout);
             assert!(res.is_ok());
             ptrs.push(res.unwrap());
         }
@@ -674,13 +674,13 @@ mod tests {
         let heap_size = 1000 - (size_of::<BlockHeader>() * 2);
 
         // allocate 3
-        let one = heap.allocate_next_fit(layout.clone());
+        let one = heap.allocate_next_fit(layout);
         assert!(one.is_ok());
 
-        let two = heap.allocate_next_fit(layout.clone());
+        let two = heap.allocate_next_fit(layout);
         assert!(two.is_ok());
 
-        let three = heap.allocate_next_fit(layout.clone());
+        let three = heap.allocate_next_fit(layout);
         assert!(three.is_ok());
 
         // dealloc 1st and 3rd
@@ -706,16 +706,16 @@ mod tests {
         let layout = new_layout();
 
         // allocate 30
-        let first = heap.allocate_next_fit(layout.clone()).unwrap();
+        let first = heap.allocate_next_fit(layout).unwrap();
         for _ in 0..29 {
-            heap.allocate_next_fit(layout.clone()).unwrap();
+            heap.allocate_next_fit(layout).unwrap();
         }
 
         // free our first one
         assert!(heap.dealloc_immediate_coalesce(first).is_ok());
 
         // relocate, I would assume this take the place of the first
-        heap.allocate_next_fit(layout.clone()).unwrap();
+        heap.allocate_next_fit(layout).unwrap();
     }
 
     /// Test that we can reuse the heap by deallocating and reallocating
@@ -727,7 +727,7 @@ mod tests {
         // allocate 30
         for _ in 0..10 {
             let ptrs: Vec<_> = (0..30)
-                .map(|_| heap.allocate_next_fit(layout.clone()).unwrap())
+                .map(|_| heap.allocate_next_fit(layout).unwrap())
                 .collect();
             dbg!(&ptrs);
 
