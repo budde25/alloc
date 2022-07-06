@@ -46,7 +46,7 @@ impl BlockAllocator {
     /// MUST INIT BEFORE USING
     pub const fn new() -> Self {
         Self {
-            current: unsafe { Block::from_header(0 as *mut BlockHeader) },
+            current: unsafe { Block::from_header(sptr::invalid_mut(0)) },
             start: sptr::invalid(0),
             previous_allocated: true,
         }
@@ -606,7 +606,7 @@ mod tests {
         let layout = new_layout();
         let res = heap.allocate_next_fit(layout);
         assert!(res.is_ok());
-        let res = heap.dealloc_immediate_coalesce(((res.unwrap() as u64) + 1) as *mut u8);
+        let res = heap.dealloc_immediate_coalesce(unsafe { res.unwrap().add(1) });
         assert_eq!(res.unwrap_err(), AllocatorError::InvalidPointer);
     }
 
