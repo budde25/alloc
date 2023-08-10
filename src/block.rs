@@ -3,7 +3,6 @@ use core::cmp::Eq;
 use core::fmt::{self, Debug, Display};
 use core::sync::atomic::AtomicBool;
 use header::{Block, BlockHeader};
-use spin::Mutex;
 use sptr::Strict;
 
 // Static variable to panic if we try to init the allocator twice
@@ -16,9 +15,12 @@ const HEADER_SIZE: u64 = 8;
 // Required since it lives under a spinlock
 unsafe impl Send for BlockAllocator {}
 
+/// An allocator error occurred
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum AllocatorError {
+    /// Allocator out of space
     OutOfSpace,
+    /// pointer is not valid
     InvalidPointer,
 }
 
@@ -252,28 +254,6 @@ impl Iterator for BlockAllocatorIterator {
     }
 }
 
-/// Allows putting a type behind a Mutex
-pub struct Locked {
-    inner: Mutex<BlockAllocator>,
-}
-
-impl Locked {
-    /// Create a new Mutex locked type
-    pub const fn new() -> Self {
-        Self {
-            inner: Mutex::new(BlockAllocator::new()),
-        }
-    }
-
-    pub unsafe fn init(&mut self, heap_start: *mut u8, heap_size: u64) {
-        self.inner.lock().init(heap_start, heap_size)
-    }
-
-    pub fn lock(&self) -> spin::MutexGuard<BlockAllocator> {
-        self.inner.lock()
-    }
-}
-
 /// panics if it would rounds above u64::max or round_to is 0
 fn round_to(value: u64, round_to: u64) -> u64 {
     (value + (round_to - 1)) & !(round_to - 1)
@@ -350,7 +330,7 @@ mod header {
         /// Get the footer block
         /// must not be called if allocated
         pub fn footer(&self) -> Self {
-            assert!(!self.is_allocated());
+            debug_assert!(!self.is_allocated());
             let ptr =
                 unsafe { self.as_mut_u8().add(self.data_size() as usize) as *mut BlockHeader };
             Block { ptr }
@@ -358,7 +338,7 @@ mod header {
 
         /// Get the next block
         pub fn next(&self) -> Self {
-            assert!(!self.is_end());
+            debug_assert!(!self.is_end());
             unsafe {
                 Self::from_header(
                     (self.as_mut_u8().add(self.total_size() as usize)) as *mut BlockHeader,
@@ -373,20 +353,20 @@ mod header {
             let ptr = unsafe {
                 (self.ptr as *mut u8).sub(previous_total_size as usize) as *mut BlockHeader
             };
-            
+
             unsafe { Self::from_header(ptr) }
         }
 
         /// Get the previous block data size
         pub fn previous_data_size(&self) -> u64 {
-            assert!(!self.is_previous_allocated());
+            debug_assert!(!self.is_previous_allocated());
             let previous_footer = unsafe { self.ptr.sub(1).read_volatile() };
             previous_footer.data_size()
         }
 
         /// Get the previous block data size
         pub fn previous_total_size(&self) -> u64 {
-            assert!(!self.is_previous_allocated());
+            debug_assert!(!self.is_previous_allocated());
             let previous_footer = unsafe { self.ptr.sub(1).read_volatile() };
             previous_footer.total_size()
         }
@@ -440,22 +420,21 @@ mod header {
     impl BlockHeader {
         /// Create a new Block header
         pub fn new(size: u64, current: bool, previous: bool) -> Self {
-            // SAFETY the other bits represent the size to they are a valid representation
-            let mut size_status = unsafe { Self::from_bits_unchecked(size) };
+            let mut size_status = Self::from_bits_retain(size);
             size_status.set(Self::CURR_ALLOC, current); // current bit
             size_status.set(Self::PREV_ALLOC, previous); // previous bit
             size_status
         }
 
         pub fn set_size(&mut self, size: u64) {
-            assert!(size % 8 == 0);
-            self.bits = (size & (u64::MAX - 7)) | (self.bits & 0b111)
+            debug_assert!(size % 8 == 0, "size not % 8");
+            *self = Self::from_bits_retain((size & (u64::MAX - 7)) | (self.bits() & 0b111));
         }
 
         /// Get the size of the data block (without taking into account the header), will always be a multiple of 8
         pub fn data_size(&self) -> u64 {
-            let size = self.bits & (u64::MAX - 7); // Ex 0b1111_1111_1111_1000 for 32 bit, 2 more bytes of leading 1s for 64bit
-            debug_assert!(size % 8 == 0);
+            let size = self.bits() & (u64::MAX - 7); // Ex 0b1111_1111_1111_1000 for 32 bit, 2 more bytes of leading 1s for 64bit
+            debug_assert!(size % 8 == 0, "size not % 8");
             size
         }
 
@@ -485,10 +464,10 @@ mod header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
-    use alloc::vec::Vec;
     use core::alloc::Layout;
     use core::mem::{align_of, size_of};
+    use std::boxed::Box;
+    use std::vec::Vec;
     extern crate std;
     use std::dbg;
     use std::vec;
